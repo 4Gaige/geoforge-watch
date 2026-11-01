@@ -11,7 +11,10 @@ Providers for live answers: set OPENAI_API_KEY, ANTHROPIC_API_KEY or PERPLEXITY_
 Without keys, use --answers-file with answers pasted from the free chat apps (honest manual mode).
 """
 import argparse, json, os, re, sys, base64, html, urllib.request, urllib.parse, urllib.error
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import time
+HERE = os.path.dirname(os.path.abspath(__file__))
+DEMO_ANSWERS = os.path.join(HERE, "sample-answers.json")
 
 UA = "GeoForgeWatch/0.1 (+readiness check)"
 AI_BOTS = ["GPTBot", "OAI-SearchBot", "ChatGPT-User", "ClaudeBot", "PerplexityBot", "Google-Extended", "Applebot-Extended", "CCBot"]
@@ -137,14 +140,20 @@ def gather(business, trade, city, answers_file=None):
         for p in prompts(trade, city):
             for prov, txt in ask_live(p):
                 recs.append({"provider": prov, "prompt": p, "answer": txt})
+    if not recs and os.getenv("GFW_DEMO_ANSWERS") == "1":
+        for r in json.load(open(DEMO_ANSWERS)): recs.append(r)
+        res = score_answers(business, recs); res["example"] = True; return res
     if not recs:
         return None
     return score_answers(business, recs)
 
 def report_md(rd, ans, business, trade, city):
     L = [f"# GeoForge Watch report: {business}", f"{trade} · {city}", ""]
+    if ans: L += ["## Does AI name you?"]
+    if ans and ans.get("example"):
+        L += ["> **EXAMPLE DATA, NOT A LIVE MEASUREMENT.** No AI provider key is set, so this section uses the invented demo fixture sample-answers.json. Competitor names below are made up.", ""]
     if ans:
-        L += [f"## Does AI name you?", f"Named in {ans['mentions']} of {ans['answers']} AI answers ({ans['mention_rate']}%).", ""]
+        L += [f"Named in {ans['mentions']} of {ans['answers']} AI answers ({ans['mention_rate']}%).", ""]
         if ans["competitors"]:
             L += ["Named instead of you most often:"] + [f"- {n} ({c}x)" for n, c in ans["competitors"]] + [""]
     else:
@@ -176,12 +185,15 @@ def _pp(method, path, tok, body=None):
         except Exception: j = {}
         return e.code, j
 
+_TOK = {"v": None, "exp": 0}
 def paypal_token():
     cid, sec = _creds()
     if not cid: return None
+    if _TOK["v"] and time.time() < _TOK["exp"]: return _TOK["v"]
     req = urllib.request.Request(PP + "/v1/oauth2/token", data=b"grant_type=client_credentials",
         headers={"Authorization": "Basic " + base64.b64encode(f"{cid}:{sec}".encode()).decode()})
-    with urllib.request.urlopen(req, timeout=30) as r: return json.loads(r.read())["access_token"]
+    with urllib.request.urlopen(req, timeout=30) as r: j = json.loads(r.read())
+    _TOK.update(v=j["access_token"], exp=time.time() + int(j.get("expires_in", 300)) - 60); return _TOK["v"]
 
 def paypal_create_order(return_url="http://127.0.0.1:8787/paid", cancel_url="http://127.0.0.1:8787/"):
     tok = paypal_token()
@@ -203,9 +215,11 @@ def paypal_create_order(return_url="http://127.0.0.1:8787/paid", cancel_url="htt
 def paypal_capture(order_id):
     """Capture; report unlocks only if status == COMPLETED."""
     tok = paypal_token()
-    if not tok: return {"mode": "mock", "http": 201, "status": "COMPLETED"}
+    if not tok: return {"mode": "mock", "http": 201, "status": "COMPLETED", "order_id": order_id, "capture_id": "MOCK-CAPTURE"}
     code, j = _pp("POST", f"/v2/checkout/orders/{urllib.parse.quote(order_id)}/capture", tok, {})
-    if code in (200, 201): return {"mode": "sandbox", "http": code, "status": j.get("status")}
+    if code in (200, 201):
+        caps = [c for pu in j.get("purchase_units", []) for c in pu.get("payments", {}).get("captures", [])]
+        return {"mode": "sandbox", "http": code, "status": j.get("status"), "order_id": j.get("id"), "capture_id": caps[0]["id"] if caps else None}
     det = (j.get("details") or [{}])[0].get("issue", "")
     return {"mode": "sandbox", "http": code, "status": "NOT_CAPTURED", "error": j.get("name", "ERROR"), "issue": det}
 
@@ -224,11 +238,14 @@ def sdk_buttons(key):
     if not cid: return ""
     return f"""<div id=pp></div><script src="https://www.paypal.com/sdk/js?client-id={html.escape(cid)}&currency=USD&intent=capture"></script>
 <script>paypal.Buttons({{createOrder:()=>fetch('/api/orders?k={key}',{{method:'POST'}}).then(r=>r.json()).then(o=>o.id),
-onApprove:d=>{{location.href='/paid?k={key}&token='+d.orderID}}}}).render('#pp');</script>"""
+onApprove:d=>{{document.getElementById('pp').style.display='none';document.getElementById('cf').style.display='block';location.href='/paid?k={key}&token='+d.orderID}}}}).render('#pp');</script>
+<p id=cf style="display:none;font-weight:600">Confirming payment&hellip;</p>"""
 
 class H(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.0"
     def send(self, body, code=200, ctype="text/html; charset=utf-8"):
-        self.send_response(code); self.send_header("Content-Type", ctype); self.end_headers(); self.wfile.write(body.encode())
+        b = body.encode(); self.send_response(code); self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(b))); self.send_header("Connection", "close"); self.end_headers(); self.wfile.write(b)
     def _order(self, k):
         o = paypal_create_order(return_url=f"http://127.0.0.1:8787/paid?k={k}")
         if o.get("id"): ORDERS[o["id"]] = k
@@ -256,13 +273,14 @@ class H(BaseHTTPRequestHandler):
         if u.path == "/paid":
             oid = q.get("token", ""); k = ORDERS.get(oid) or (q.get("k") if pay_mode() == "mock" else None)
             if not oid or k not in PENDING: return self.send("<p>Unknown order.</p>", 400)
-            cap = paypal_capture(oid)
+            t0 = time.time(); cap = paypal_capture(oid); dt = time.time() - t0
+            print(f"capture {cap.get('status')} HTTP {cap.get('http')} in {dt:.2f}s", flush=True)
             if cap.get("status") != "COMPLETED":
                 return self.send(f"<p>Payment not completed (HTTP {cap.get('http')}, {html.escape(str(cap.get('issue') or cap.get('error')))}). No charge was made and the report stays locked.</p><p><a href='/buy?k={k}'>Try again</a></p>", 402)
             ORDERS.pop(oid, None); rd, form = PENDING[k]
             ans = gather(form["business"], form.get("trade", "roofer"), form.get("city", ""), os.getenv("GFW_ANSWERS_FILE"))
             md = report_md(rd, ans, form["business"], form.get("trade", ""), form.get("city", ""))
-            return self.send(f"<!doctype html><meta charset=utf-8>{CSS}<p>Payment: {cap['status']} ({cap['mode']})</p><pre>{html.escape(md)}</pre>")
+            return self.send(f"<!doctype html><meta charset=utf-8>{CSS}<p>Payment: {cap['status']} ({cap['mode']})<br>PayPal order ID: <code>{html.escape(str(cap.get('order_id')))}</code><br>Capture ID: <code>{html.escape(str(cap.get('capture_id')))}</code></p><pre>{html.escape(md)}</pre>")
         self.send("not found", 404)
     def log_message(self, *a): pass
 
@@ -274,6 +292,7 @@ def main():
     d = sp.add_parser("report"); d.add_argument("url"); [d.add_argument(x, required=True) for x in ("--business", "--trade", "--city")]
     d.add_argument("--answers-file"); d.add_argument("--out")
     sv = sp.add_parser("serve"); sv.add_argument("--mock", action="store_true", help="force mock checkout")
+    sv.add_argument("--demo-answers", action="store_true", help="with no AI key, use the EXAMPLE sample-answers.json fixture (labeled)")
     sp.add_parser("paypal-selftest", help="create a sandbox order and try an unapproved capture")
     o = ap.parse_args()
     if o.cmd == "readiness":
@@ -297,7 +316,8 @@ def main():
     elif o.cmd == "serve":
         global FORCE_MOCK
         if o.mock: FORCE_MOCK = True
+        if o.demo_answers: os.environ["GFW_DEMO_ANSWERS"] = "1"
         print("GeoForge Watch demo on http://127.0.0.1:8787 (PayPal:", pay_mode(), ")")
-        HTTPServer(("127.0.0.1", 8787), H).serve_forever()
+        ThreadingHTTPServer(("127.0.0.1", 8787), H).serve_forever()
 
 if __name__ == "__main__": main()

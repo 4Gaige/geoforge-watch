@@ -21,6 +21,10 @@ python3 gfwatch.py serve             # http://127.0.0.1:8787  (add --mock to for
 ```
 Python 3.10+, standard library only. Sandbox is the default when `PAYPAL_SANDBOX_CLIENT_ID` and `PAYPAL_SANDBOX_CLIENT_SECRET` are set; with no keys (or `--mock` / `GFW_MOCK=1`) checkout runs in mock mode and says so on screen.
 
+Demo mode for the AI-answer section: `python3 gfwatch.py serve --demo-answers` (or `GFW_DEMO_ANSWERS=1`). With no AI key set, it loads the invented `sample-answers.json` fixture and the report shows a banner saying it is EXAMPLE DATA, not a live measurement. Any AI key set means live answers are used instead.
+
+The paid page shows the PayPal order ID and capture ID.
+
 ## PayPal sandbox setup
 1. At developer.paypal.com, create a Sandbox REST app (Merchant).
 2. Copy its Client ID and Secret into `.env` (see `.env.example`). `.env` is git-ignored; never commit keys.
