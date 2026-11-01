@@ -1,0 +1,8 @@
+.env
+.env.*
+!.env.example
+*.env
+secrets/
+__pycache__/
+*.pyc
+answers.json
