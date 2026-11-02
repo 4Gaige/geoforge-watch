@@ -9,6 +9,8 @@ Built for the PayPal AI Hackathon (submission closes Thu Nov 12, 2026, 12:00 pm 
 2. AI answer check: asks five buyer-style questions ("Who are the best painters in Birmingham, AL?") to the AI providers you have keys for, then counts how often the business is named and which competitors are named instead. With no key, it prints the questions so you can paste answers from the free chat apps (manual mode, labeled as such in the report).
 3. Paid report through PayPal: the free check ends with a $29 checkout. PayPal Orders v2 REST (sandbox, Python stdlib only) creates an order for "GeoForge Watch full report" ($29.00 USD), sends the buyer to PayPal to approve, captures on return, and unlocks the full report **only when the capture status is COMPLETED**. An unapproved or forged order returns an error and the report stays locked. The page also shows PayPal JS SDK Smart Buttons (client ID only in the browser; the secret stays on the server).
 
+- Results table built with [AG Grid Community](https://www.ag-grid.com/) (MIT, loaded from jsdelivr): sortable, filterable AI-answer rows on the free preview and the paid report.
+
 ## Run it
 ```
 python3 gfwatch.py readiness https://buildwithcbhomes.com

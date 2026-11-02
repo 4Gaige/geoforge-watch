@@ -124,10 +124,12 @@ def score_answers(business, records):
     """records: [{provider, prompt, answer}] -> mention stats + competitors named."""
     b = norm(business); hits = 0; names = {}
     for r in records:
-        a = r["answer"]; r["mentioned"] = b in norm(a); hits += r["mentioned"]
+        a = r["answer"]; r["mentioned"] = b in norm(a); hits += r["mentioned"]; r["named"] = []
         for m in re.findall(r"\*\*([^*]{3,60})\*\*|^\s*\d+\.\s+([A-Z][^\n:–-]{2,60})", a, re.M):
             n = (m[0] or m[1]).strip()
-            if n and norm(n) != b: names[n] = names.get(n, 0) + 1
+            if n and norm(n) != b:
+                names[n] = names.get(n, 0) + 1
+                if n not in r["named"]: r["named"].append(n)
     rate = round(100 * hits / len(records)) if records else 0
     return {"mention_rate": rate, "answers": len(records), "mentions": hits,
             "competitors": sorted(names.items(), key=lambda x: -x[1])[:10], "records": records}
@@ -223,10 +225,32 @@ def paypal_capture(order_id):
     det = (j.get("details") or [{}])[0].get("issue", "")
     return {"mode": "sandbox", "http": code, "status": "NOT_CAPTURED", "error": j.get("name", "ERROR"), "issue": det}
 
+
+# ---------- AG Grid Community (MIT) results table ----------
+AGG = "https://cdn.jsdelivr.net/npm/ag-grid-community@36.2.0/dist/ag-grid-community.min.js"
+def grid_html(ans, full):
+    """Sortable/filterable AI-answer table. Preview hides competitor names (they are the paid part)."""
+    if not ans: return "<p><em>AI answers not measured: no provider key set.</em></p>"
+    rows = [{"query": r["prompt"], "engine": r["provider"], "mentioned": "Yes" if r["mentioned"] else "No",
+             "named": ", ".join(r.get("named", [])) if full else f"{len(r.get('named', []))} competitor(s), unlock to see",
+             "answer": r["answer"][:300] if full else ""} for r in ans["records"]]
+    cols = [{"field": "query", "headerName": "AI query", "flex": 2, "wrapText": True, "autoHeight": True},
+            {"field": "engine", "headerName": "Engine", "width": 110},
+            {"field": "mentioned", "headerName": "Named you?", "width": 125},
+            {"field": "named", "headerName": "Named instead", "flex": 2, "wrapText": True, "autoHeight": True}]
+    if full: cols.append({"field": "answer", "headerName": "Answer excerpt", "flex": 3, "wrapText": True, "autoHeight": True})
+    banner = ("<p class=ex><strong>EXAMPLE DATA, NOT A LIVE MEASUREMENT.</strong> No AI provider key is set; rows come from the invented fixture sample-answers.json.</p>"
+              if ans.get("example") else "")
+    cfg = json.dumps({"rowData": rows, "columnDefs": cols,
+        "defaultColDef": {"sortable": True, "filter": True, "resizable": True}, "domLayout": "autoHeight"}).replace("</", "<\\/")
+    return f"""<h2>Does AI name you? {ans['mentions']} of {ans['answers']} answers ({ans['mention_rate']}%)</h2>{banner}
+<div id=grid style="width:100%"></div><p class=note>Table: AG Grid Community (MIT). Click a header to sort; use the menu to filter.</p>
+<script src="{AGG}"></script><script>agGrid.createGrid(document.getElementById('grid'),{cfg});</script>"""
+
 # ---------- local demo server ----------
-PENDING = {}; ORDERS = {}
-CSS = """<style>body{font:16px/1.5 system-ui;max-width:720px;margin:40px auto;padding:0 16px}input{display:block;width:100%;padding:8px;margin:4px 0 12px}
-button{padding:10px 16px}pre{white-space:pre-wrap;background:#f4f4f4;padding:12px}</style>"""
+PENDING = {}; ORDERS = {}; ANS = {}
+CSS = """<style>body{font:16px/1.5 system-ui;max-width:960px;margin:40px auto;padding:0 16px}input{display:block;width:100%;padding:8px;margin:4px 0 12px}
+button{padding:10px 16px}pre{white-space:pre-wrap;background:#f4f4f4;padding:12px}.ex{background:#fff4d6;border-left:4px solid #e0a400;padding:8px 12px}.note{color:#666;font-size:13px}</style>"""
 FORM = """<!doctype html><meta charset=utf-8><title>GeoForge Watch</title>""" + CSS + """
 <h1>When someone asks AI for a roofer in your town, are you the answer?</h1>
 <p>Free: the site check. $29 (PayPal sandbox in this demo): the full report with which competitors AI names instead of you.</p>
@@ -260,8 +284,9 @@ class H(BaseHTTPRequestHandler):
         if u.path == "/": return self.send(FORM)
         if u.path == "/check":
             rd = readiness(q["url"]); key = str(len(PENDING) + 1); PENDING[key] = (rd, q)
+            ans = gather(q["business"], q.get("trade", "roofer"), q.get("city", ""), os.getenv("GFW_ANSWERS_FILE")); ANS[key] = ans
             rows = "".join(f"<li>{'✔' if c['ok'] else '✖'} {html.escape(c['check'])}: {html.escape(c['detail'])}</li>" for c in rd["checks"])
-            return self.send(f"<!doctype html><meta charset=utf-8>{CSS}<h1>Site check: {rd['score']}/100</h1><ul>{rows}</ul>"
+            return self.send(f"<!doctype html><meta charset=utf-8>{CSS}<h1>Site check: {rd['score']}/100</h1><ul>{rows}</ul>{grid_html(ans, False)}"
                 f"<p><a href='/buy?k={key}'><button>Get full report ($29, PayPal {pay_mode()})</button></a></p>{sdk_buttons(key)}<p><a href=/>Back</a></p>")
         if u.path == "/buy":
             k = q.get("k")
@@ -278,9 +303,9 @@ class H(BaseHTTPRequestHandler):
             if cap.get("status") != "COMPLETED":
                 return self.send(f"<p>Payment not completed (HTTP {cap.get('http')}, {html.escape(str(cap.get('issue') or cap.get('error')))}). No charge was made and the report stays locked.</p><p><a href='/buy?k={k}'>Try again</a></p>", 402)
             ORDERS.pop(oid, None); rd, form = PENDING[k]
-            ans = gather(form["business"], form.get("trade", "roofer"), form.get("city", ""), os.getenv("GFW_ANSWERS_FILE"))
+            ans = ANS.get(k) or gather(form["business"], form.get("trade", "roofer"), form.get("city", ""), os.getenv("GFW_ANSWERS_FILE"))
             md = report_md(rd, ans, form["business"], form.get("trade", ""), form.get("city", ""))
-            return self.send(f"<!doctype html><meta charset=utf-8>{CSS}<p>Payment: {cap['status']} ({cap['mode']})<br>PayPal order ID: <code>{html.escape(str(cap.get('order_id')))}</code><br>Capture ID: <code>{html.escape(str(cap.get('capture_id')))}</code></p><pre>{html.escape(md)}</pre>")
+            return self.send(f"<!doctype html><meta charset=utf-8>{CSS}<p>Payment: {cap['status']} ({cap['mode']})<br>PayPal order ID: <code>{html.escape(str(cap.get('order_id')))}</code><br>Capture ID: <code>{html.escape(str(cap.get('capture_id')))}</code></p>{grid_html(ans, True)}<pre>{html.escape(md)}</pre>")
         self.send("not found", 404)
     def log_message(self, *a): pass
 
