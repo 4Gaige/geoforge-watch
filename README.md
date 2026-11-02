@@ -33,7 +33,8 @@ flowchart LR
 - [x] Orders v2 capture; report unlocks **only** on `COMPLETED`, and only for an order this server created
 - [x] Order ID and capture ID shown on the receipt
 - [x] Refusal path tested: `paypal-selftest` proves an unapproved capture returns 422 `ORDER_NOT_APPROVED`
-- [ ] Planned: Subscriptions for weekly monitoring, Venmo button
+- [x] Subscriptions v1: weekly watch at $29/month. The server creates a catalog product and monthly billing plan once (`/v1/catalogs/products`, `/v1/billing/plans`), the JS SDK renders Subscribe buttons (`vault=true&intent=subscription`), and the server checks `/v1/billing/subscriptions/{id}` before it confirms the watch
+- [ ] Planned: Venmo button, scheduled weekly re-check job
 
 ## What was built during the hackathon
 Everything in this repo was written during the PayPal AI Hackathon submission period (see the commit history, starting Oct 31 2026): the site check, the PayPal Orders v2 sandbox checkout and Smart Buttons, the multi-engine AI provider layer with structured JSON output, the post-payment fix generator, the AG Grid tables and CSV export, and the report design. Built with my AI agent under my direction (Gaige Roberson, with Monty, a Grok Bot agent, writing most of the code).
@@ -86,6 +87,16 @@ Use any PayPal sandbox Personal account, or run with your own sandbox app keys. 
 - AI answers vary run to run; the report is a snapshot.
 - Live engines list the businesses they named as JSON. Answers you paste in by hand (manual mode) still use simple patterns (numbered or bold names) and can miss some.
 - No ranking is promised.
+
+## v3 report (Nov 2)
+- Ranked list of every business AI named, with yours marked (names unlock after payment)
+- Per-engine cards (one square per question) and a business × engine heat matrix in AG Grid, CSV export
+- Action plan with priority, impact and effort for each fix
+- Full answer text as cards with every business name highlighted (replaces the cramped excerpt column)
+- Share link: each paid report gets an unguessable `/r/<token>` URL, saved under `data/` (git-ignored)
+- Save as PDF through a print stylesheet
+- Re-check button and an "Over time" trend for each site, saved per check
+- Design notes and references: [docs/design-v3.md](docs/design-v3.md)
 
 ## Roadmap inside the hackathon window
 - PayPal Subscriptions for weekly monitoring ($29/mo draft price), with a change alert when the mention rate drops.

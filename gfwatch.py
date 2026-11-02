@@ -327,146 +327,405 @@ def paypal_capture(order_id):
     return {"mode": "sandbox", "http": code, "status": "NOT_CAPTURED", "error": j.get("name", "ERROR"), "issue": det}
 
 
+# ---------- PayPal Subscriptions (sandbox): weekly watch, $29/month ----------
+DATA = os.path.join(HERE, "data"); os.makedirs(os.path.join(DATA, "reports"), exist_ok=True)
+WATCH_PRICE = "29.00"
+def _jload(p, d):
+    try: return json.load(open(p))
+    except Exception: return d
+def _jsave(p, v):
+    tmp = p + ".tmp"; json.dump(v, open(tmp, "w"), indent=1, default=list); os.replace(tmp, p)
+
+def paypal_plan_id():
+    """Create (once) a sandbox catalog product + monthly billing plan; cache the plan ID in data/paypal-plan.json."""
+    tok = paypal_token()
+    if not tok: return "MOCK-PLAN"
+    p = os.path.join(DATA, "paypal-plan.json"); c = _jload(p, {})
+    if c.get("plan_id"): return c["plan_id"]
+    code, prod = _pp("POST", "/v1/catalogs/products", tok, {"name": "GeoForge Watch weekly watch", "type": "SERVICE", "category": "SOFTWARE",
+        "description": "Re-asks AI engines the same homeowner questions every week and reports changes."})
+    if code not in (200, 201): return None
+    code, plan = _pp("POST", "/v1/billing/plans", tok, {"product_id": prod["id"], "name": "Weekly watch, monthly billing",
+        "billing_cycles": [{"frequency": {"interval_unit": "MONTH", "interval_count": 1}, "tenure_type": "REGULAR", "sequence": 1, "total_cycles": 0,
+                            "pricing_scheme": {"fixed_price": {"value": WATCH_PRICE, "currency_code": "USD"}}}],
+        "payment_preferences": {"auto_bill_outstanding": True, "payment_failure_threshold": 1}})
+    if code not in (200, 201): return None
+    _jsave(p, {"product_id": prod["id"], "plan_id": plan["id"]}); return plan["id"]
+
+def paypal_subscription(sid):
+    """Server-side check of a subscription the buyer approved. Watch starts only on ACTIVE."""
+    tok = paypal_token()
+    if not tok: return {"mode": "mock", "status": "ACTIVE", "id": sid}
+    code, j = _pp("GET", f"/v1/billing/subscriptions/{urllib.parse.quote(sid)}", tok)
+    return {"mode": "sandbox", "http": code, "status": j.get("status", "UNKNOWN"), "id": j.get("id"), "plan_id": j.get("plan_id"),
+            "next": (j.get("billing_info") or {}).get("next_billing_time")}
+
+# ---------- history (re-check tracking over time) ----------
+def host_of(url): return urllib.parse.urlparse(url if url.startswith("http") else "https://" + url).netloc.lower().removeprefix("www.")
+def record_history(rd, ans):
+    p = os.path.join(DATA, "history.json"); h = _jload(p, {}); k = host_of(rd["url"])
+    h.setdefault(k, []).append({"ts": time.strftime("%Y-%m-%d %H:%M"), "score": rd["score"], "rate": ans["mention_rate"] if ans else None,
+                                "example": bool(ans and ans.get("example"))})
+    h[k] = h[k][-26:]; _jsave(p, h); return h[k]
+def history_for(url): return _jload(os.path.join(DATA, "history.json"), {}).get(host_of(url), [])
+
 # ---------- AG Grid Community (MIT) tables ----------
 AGG = "https://cdn.jsdelivr.net/npm/ag-grid-community@36.2.0/dist/ag-grid-community.min.js"
 GRID_JS = """<script src="%s"></script><script>
-function gfwGrid(id, cfg){ (cfg.columnDefs||[]).forEach(c=>{ if(c.bar) c.cellRenderer=p=>'<span class=bar><i style="width:'+(p.value||0)+'%%"></i></span> '+(p.value||0)+'%%';
-  if(c.yes) c.cellRenderer=p=>'<span class="chip '+(p.value==='Yes'?'ok':'no')+'">'+p.value+'</span>'; });
-  cfg.defaultColDef={sortable:true,filter:true,resizable:true}; cfg.domLayout='autoHeight';
+const gfwTheme=()=>agGrid.themeQuartz.withParams({fontFamily:'"IBM Plex Sans",system-ui,sans-serif',fontSize:14,headerFontWeight:600,
+  headerBackgroundColor:'#f3f0e8',borderColor:'#e2ddd2',accentColor:'#e8730c',foregroundColor:'#14181f',rowBorder:true,wrapperBorderRadius:10,spacing:7});
+function gfwGrid(id, cfg){ const mx=cfg.heatMax||1;
+  (cfg.columnDefs||[]).forEach(c=>{ if(c.bar) c.cellRenderer=p=>'<span class=bar><i style="width:'+(p.value||0)+'%%"></i></span> '+(p.value||0)+'%%';
+  if(c.yes) c.cellRenderer=p=>'<span class="chip '+(p.value==='Yes'?'ok':'no')+'">'+p.value+'</span>';
+  if(c.heat){ c.cellStyle=p=>{const a=(p.value||0)/mx;return {background:'rgba(19,35,63,'+(0.06+0.86*a).toFixed(2)+')',color:a>.45?'#fff':'#14181f',fontVariantNumeric:'tabular-nums',textAlign:'center'}};
+    c.valueFormatter=p=>(p.value||0)+'%%'; }
+  if(c.you) c.cellRenderer=p=>p.data.you?'<b>'+p.value+'</b> <span class="chip you">You</span>':p.value; });
+  delete cfg.heatMax; cfg.theme=gfwTheme(); cfg.defaultColDef={sortable:true,filter:true,resizable:true}; cfg.domLayout='autoHeight';
   window['api_'+id]=agGrid.createGrid(document.getElementById(id),cfg); }
 function gfwCsv(id,name){ window['api_'+id].exportDataAsCsv({fileName:name}); }
 function gfwCopy(id,btn){ navigator.clipboard.writeText(document.getElementById(id).innerText).then(()=>{btn.textContent='Copied';setTimeout(()=>btn.textContent='Copy',1500)}); }
+function gfwShare(btn){ navigator.clipboard.writeText(btn.dataset.url).then(()=>{btn.textContent='Link copied';setTimeout(()=>btn.textContent='Copy share link',1800)}); }
 </script>""" % AGG
 
-def _cfg(rows, cols): return json.dumps({"rowData": rows, "columnDefs": cols}).replace("</", "<\\/")
+def _cfg(rows, cols, **extra): return json.dumps({"rowData": rows, "columnDefs": cols, **extra}).replace("</", "<\\/")
+E = html.escape
 
 def example_banner(ans):
-    return ("<div class=ex><strong>EXAMPLE DATA, NOT A LIVE MEASUREMENT.</strong> No AI provider key is set, so these rows come from the "
-            "invented fixture sample-answers.json. Engine and business names are made up.</div>") if ans and ans.get("example") else ""
+    return ("<div class=ex><b>Example data, not a live measurement.</b> No AI key is set yet, so the answers below come from the invented "
+            "fixture <code>sample-answers.json</code>. Engine and business names are made up. Add a free <code>GEMINI_API_KEY</code> for live answers.</div>") if ans and ans.get("example") else ""
 
-def answers_grid(ans, full):
-    """Engine x query rows. The preview hides competitor names (they are the paid part)."""
-    if not ans: return "<p class=note>AI answers not measured: no provider key set.</p>"
-    rows = [{"engine": r["provider"], "query": r["prompt"], "mentioned": "Yes" if r["mentioned"] else "No",
-             "named": ", ".join(r["named"]) if full else f"{len(r['named'])} named, unlock to see",
-             "extraction": r.get("extraction", ""), "answer": r["answer"][:400] if full else ""} for r in ans["records"]]
-    cols = [{"field": "engine", "headerName": "Engine", "width": 165, "pinned": "left"},
-            {"field": "query", "headerName": "What the homeowner asked", "flex": 2, "wrapText": True, "autoHeight": True},
-            {"field": "mentioned", "headerName": "Named you?", "width": 120, "yes": True},
-            {"field": "named", "headerName": "Named instead", "flex": 2, "wrapText": True, "autoHeight": True}]
-    if full:
-        cols += [{"field": "answer", "headerName": "Answer excerpt", "flex": 3, "wrapText": True, "autoHeight": True},
-                 {"field": "extraction", "headerName": "Names read by", "width": 140}]
-    csv = "<button class=ghost onclick=\"gfwCsv('ga','geoforge-ai-answers.csv')\">Export CSV</button>" if full else ""
-    return f"<div class=gridhead><h3>Every answer, by engine</h3>{csv}</div><div id=ga></div><script>gfwGrid('ga',{_cfg(rows, cols)})</script>"
-
-def competitor_grid(ans, business):
-    """One row per business AI named, grouped across engines and queries, with mention rate and per-engine counts."""
-    if not ans: return ""
-    engines = list(ans["engines"]); total = ans["answers"]
-    you = {"business": business + " (you)", "count": ans["mentions"], "rate": ans["mention_rate"]}
-    for e in engines: you[e] = ans["engines"][e]["mentions"]
-    rows = [you]
-    for c in ans["competitors"]:
-        r = {"business": c["name"], "count": c["count"], "rate": c["rate"]}
-        for e in engines: r[e] = sum(1 for x in ans["records"] if x["provider"] == e and c["name"] in x["named"])
-        rows.append(r)
-    cols = [{"field": "business", "headerName": "Business", "flex": 2, "pinned": "left"},
-            {"field": "rate", "headerName": f"Mention rate (of {total})", "width": 200, "bar": True, "sort": "desc"},
-            {"field": "count", "headerName": "Answers", "width": 110}] + \
-           [{"field": e, "headerName": e, "width": 165, "headerTooltip": f"answers from {e} naming this business"} for e in engines]
-    return (f"<div class=gridhead><h3>Who AI names, grouped by business</h3><button class=ghost onclick=\"gfwCsv('gc','geoforge-competitors.csv')\">Export CSV</button></div>"
-            f"<div id=gc></div><script>gfwGrid('gc',{_cfg(rows, cols)})</script>")
-
-# ---------- design (taste refs in commit note: GeoForge navy + orange, report-not-dashboard, plain trusted checkout) ----------
-CSS = """<style>
-:root{--navy:#13233f;--orange:#e8730c;--ink:#1c2430;--mute:#5b6675;--line:#e3e6ea;--paper:#fbfaf7;--ok:#1f7a4d;--no:#b4401b}
-*{box-sizing:border-box}body{margin:0;font:16px/1.55 -apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;color:var(--ink);background:var(--paper)}
-header{background:var(--navy);color:#fff;padding:14px 24px;display:flex;justify-content:space-between;align-items:center}
-header b{letter-spacing:.02em}header span{font-size:13px;opacity:.8}main{max-width:1040px;margin:0 auto;padding:28px 20px 60px}
-h1{font-size:30px;line-height:1.2;margin:8px 0 12px;color:var(--navy)}h2{color:var(--navy);margin:34px 0 10px;font-size:22px}h3{margin:0;font-size:17px}
-.card{background:#fff;border:1px solid var(--line);border-radius:10px;padding:20px;margin:16px 0}
-.row{display:flex;gap:16px;flex-wrap:wrap}.row>.card{flex:1;min-width:280px;margin:0}
-label{display:block;font-weight:600;font-size:14px;margin-top:10px}input{display:block;width:100%;padding:10px;margin:4px 0;border:1px solid #c9ced6;border-radius:6px;font-size:16px}
-button{font:inherit;cursor:pointer;border-radius:6px}.primary{background:var(--orange);color:#fff;border:0;padding:12px 20px;font-weight:700;margin-top:14px}
-.ghost{background:#fff;border:1px solid #c9ced6;padding:5px 12px;font-size:13px}
-.gridhead{display:flex;justify-content:space-between;align-items:center;margin:22px 0 8px}
-.ex{background:#fff4e0;border-left:4px solid var(--orange);padding:10px 14px;margin:10px 0;border-radius:4px}
-.note{color:var(--mute);font-size:13px}.price{font-size:28px;font-weight:800;color:var(--navy)}
-.chip{display:inline-block;padding:1px 10px;border-radius:99px;font-size:13px;font-weight:600}.chip.ok{background:#e3f3ea;color:var(--ok)}.chip.no{background:#fbe7df;color:var(--no)}
-.bar{display:inline-block;width:90px;height:8px;background:#eef0f3;border-radius:4px;vertical-align:middle}.bar i{display:block;height:8px;background:var(--orange);border-radius:4px}
-ul.checks{list-style:none;padding:0;margin:0}ul.checks li{padding:8px 0;border-bottom:1px solid var(--line)}ul.checks .d{color:var(--mute);font-size:14px}
-pre.code{background:#0f1b30;color:#e8edf5;padding:14px;border-radius:8px;overflow:auto;font-size:13px;white-space:pre-wrap;margin:0}
-.fix{margin:14px 0}.fixhead{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}
-.receipt{display:grid;grid-template-columns:auto 1fr;gap:4px 16px;font-size:14px}.receipt code{font-size:13px}
-.gauge{text-align:center}.gauge .lbl{font-size:14px;color:var(--mute);margin-top:-8px}
-table.t{border-collapse:collapse;width:100%;font-size:14px}table.t td,table.t th{border-bottom:1px solid var(--line);padding:8px;text-align:left}
-footer{color:var(--mute);font-size:13px;margin-top:40px}
+# ---------- design v3: family H (one metaphor: "the answer"), refs in docs/design-v3.md ----------
+CSS = """<link rel=preconnect href=https://fonts.googleapis.com><link rel=stylesheet href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,650&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap"><style>
+:root{--navy:#13233f;--orange:#e8730c;--ink:#14181f;--mute:#5d6470;--line:#e2ddd2;--paper:#f7f5f0;--card:#fff;--ok:#1d7148;--no:#b0401c;--soft:#f3f0e8}
+*{box-sizing:border-box}html{-webkit-font-smoothing:antialiased}body{margin:0;font:16px/1.6 "IBM Plex Sans",system-ui,sans-serif;color:var(--ink);background:var(--paper)}
+a{color:var(--navy)}code,.mono{font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:.86em}
+.top{display:flex;justify-content:space-between;align-items:center;padding:14px 32px;border-bottom:1px solid var(--line);background:var(--paper);position:sticky;top:0;z-index:5}
+.brand{display:flex;gap:10px;align-items:center;font-weight:600;text-decoration:none;color:var(--ink)}.brand i{width:14px;height:14px;background:var(--orange);display:inline-block;border-radius:3px;box-shadow:5px 5px 0 var(--navy)}
+.pills{display:flex;gap:8px}.pill{font:500 12px/1 "IBM Plex Mono",monospace;padding:6px 9px;border:1px solid var(--line);border-radius:99px;color:var(--mute);background:#fff}.pill.warn{border-color:#f0c48f;color:#8a4a0a;background:#fff6eb}
+.wrap{max-width:1160px;margin:0 auto;padding:0 32px}
+h1,h2,.display{font-family:Fraunces,Georgia,serif;font-weight:650;letter-spacing:-.015em;color:var(--navy)}
+h1{font-size:clamp(38px,4.4vw,60px);line-height:1.04;margin:0 0 20px;max-width:12ch}h2{font-size:30px;line-height:1.15;margin:0 0 6px}h3{font-size:16px;margin:0 0 6px}
+.eyebrow{font:500 12px/1 "IBM Plex Mono",monospace;letter-spacing:.08em;text-transform:uppercase;color:var(--orange);margin-bottom:14px}
+.lede{font-size:19px;color:#353b45;max-width:36em}.mute{color:var(--mute)}.small{font-size:14px}
+.hero{display:grid;grid-template-columns:1.1fr .9fr;gap:64px;align-items:start;padding:64px 0 56px}.hero .answer{margin-top:44px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:24px}
+form.check{margin-top:28px;display:grid;grid-template-columns:1fr 1fr;gap:12px 14px;max-width:560px}
+form.check .full{grid-column:1/-1}label{display:block;font-weight:500;font-size:13px;color:var(--mute)}
+input{display:block;width:100%;padding:12px 13px;margin-top:5px;border:1px solid #cfc9bc;border-radius:8px;font:16px "IBM Plex Sans",sans-serif;background:#fff}
+input:focus{outline:2px solid var(--orange);outline-offset:1px;border-color:transparent}
+button,.btn{font:600 15px "IBM Plex Sans",sans-serif;cursor:pointer;border-radius:8px;text-decoration:none;display:inline-flex;align-items:center;gap:8px}
+.primary{background:var(--orange);color:#fff;border:0;padding:13px 22px}.primary:hover{background:#cf6609}
+.ghost{background:#fff;border:1px solid #cfc9bc;color:var(--ink);padding:8px 13px;font-size:14px}.ghost:hover{border-color:var(--navy)}
+/* the answer object */
+.answer{background:#fff;border:1px solid var(--line);border-radius:16px;box-shadow:0 24px 48px -28px rgba(19,35,63,.35);overflow:hidden}
+.answer .q{background:var(--navy);color:#fff;padding:16px 20px;font-size:15px}.answer .q b{color:#ffb36b;font-weight:500}
+.answer ol{margin:0;padding:8px 20px 4px 20px;list-style:none;counter-reset:n}.answer li{counter-increment:n;display:flex;gap:14px;align-items:center;padding:13px 0;border-bottom:1px solid var(--soft)}
+.answer li:before{content:counter(n);font:500 13px "IBM Plex Mono",monospace;color:var(--mute);width:18px}
+.answer li>span:first-child{flex:1}.answer li.you{color:var(--no)}.answer li.you span{text-decoration:line-through;text-decoration-color:var(--no)}
+.answer .cap{padding:12px 20px 16px;font-size:13px;color:var(--mute)}
+.steps{display:grid;grid-template-columns:repeat(3,1fr);border-top:1px solid var(--line);border-bottom:1px solid var(--line);margin:24px 0 64px}
+.steps div{padding:26px 26px 28px 0}.steps div+div{padding-left:26px;border-left:1px solid var(--line)}.steps .n{font:500 13px "IBM Plex Mono",monospace;color:var(--orange)}
+.offer{display:grid;grid-template-columns:1fr 1fr 1fr;gap:16px;margin-bottom:72px}.offer .price{font-family:Fraunces,serif;font-size:40px;color:var(--navy);font-weight:650;line-height:1}
+.offer ul{padding-left:18px;margin:12px 0 0}.offer li{margin:4px 0}.offer .card.hl{border:2px solid var(--navy)}
+/* report */
+.rhead{padding:44px 0 22px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;gap:24px;align-items:flex-end}
+.rhead h1{font-size:46px;margin:0 0 8px;max-width:none}.actions{display:flex;gap:8px;flex-wrap:wrap}
+.kpis{display:grid;grid-template-columns:repeat(4,1fr);border-bottom:1px solid var(--line)}
+.kpi{padding:22px 22px 22px 0}.kpi+.kpi{padding-left:22px;border-left:1px solid var(--line)}.kpi .v{font-family:Fraunces,serif;font-size:44px;font-weight:650;color:var(--navy);line-height:1.05;font-variant-numeric:tabular-nums}
+.kpi .v small{font-size:20px;color:var(--mute)}.kpi .l{font-size:13px;color:var(--mute)}.kpi .d{font-size:13px;margin-top:4px}
+.layout{display:grid;grid-template-columns:minmax(0,1fr) 340px;gap:40px;align-items:start}.layout.one{grid-template-columns:minmax(0,1fr)}
+aside{position:sticky;top:76px;margin-top:40px}
+section.s{padding:40px 0 8px}section.s .num{font:500 12px "IBM Plex Mono",monospace;color:var(--orange);letter-spacing:.08em}
+.sh{display:flex;justify-content:space-between;align-items:flex-end;gap:16px;margin-bottom:16px}.sh p{margin:0}
+.rank{list-style:none;margin:0;padding:0}.rank li{display:grid;grid-template-columns:28px minmax(0,1fr) 180px 48px;gap:12px;align-items:center;padding:11px 0;border-bottom:1px solid var(--line)}
+.rank .i{font:500 13px "IBM Plex Mono",monospace;color:var(--mute)}.rank .b{height:8px;background:var(--soft);border-radius:4px}.rank .b i{display:block;height:8px;background:var(--navy);border-radius:4px}
+.rank li.you{background:#fff6eb;margin:0 -12px;padding:11px 12px;border-radius:8px;border-bottom-color:transparent}.rank li.you .b i{background:var(--orange)}.rank .p{text-align:right;font-variant-numeric:tabular-nums;font-weight:600}
+.blur{filter:blur(5px);user-select:none}
+.chip{display:inline-block;padding:2px 9px;border-radius:99px;font:600 12px "IBM Plex Sans",sans-serif;white-space:nowrap}.chip.ok{background:#e1f1e8;color:var(--ok)}.chip.no{background:#f9e5dc;color:var(--no)}
+.chip.you{background:var(--orange);color:#fff}.chip.p1{background:var(--no);color:#fff}.chip.p2{background:#f6d8b8;color:#7a3d05}.chip.p3{background:var(--soft);color:var(--mute)}.chip.lo{background:#e1f1e8;color:var(--ok)}.chip.md{background:#fbecd6;color:#7a4a05}.chip.hi{background:#f9e5dc;color:var(--no)}
+.bar{display:inline-block;width:90px;height:8px;background:var(--soft);border-radius:4px;vertical-align:middle}.bar i{display:block;height:8px;background:var(--orange);border-radius:4px}
+.engines{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px;margin-bottom:20px}
+.eng .v{font-family:Fraunces,serif;font-size:34px;color:var(--navy);font-weight:650}.eng .dots{display:flex;gap:5px;margin-top:8px}.eng .dots i{width:16px;height:16px;border-radius:4px;background:var(--soft);border:1px solid var(--line)}.eng .dots i.on{background:var(--orange);border-color:var(--orange)}
+table.plan{width:100%;border-collapse:collapse;font-size:15px;background:#fff;border:1px solid var(--line);border-radius:12px;overflow:hidden}
+table.plan th{text-align:left;font:600 12px "IBM Plex Mono",monospace;text-transform:uppercase;letter-spacing:.06em;color:var(--mute);background:var(--soft);padding:10px 14px}
+table.plan td{padding:14px;border-top:1px solid var(--line);vertical-align:top}table.plan td.t b{display:block}table.plan td.t span{color:var(--mute);font-size:14px}
+.quotes{display:grid;grid-template-columns:1fr 1fr;gap:14px}.quote{background:#fff;border:1px solid var(--line);border-radius:12px;padding:18px}
+.quote .meta{display:flex;justify-content:space-between;gap:10px;font-size:13px;color:var(--mute);margin-bottom:8px}.quote .qq{font-weight:600;margin-bottom:8px}.quote p{margin:0;font-size:15px;color:#353b45}
+mark{background:#e9edf5;color:var(--navy);padding:0 3px;border-radius:3px}mark.you{background:#ffe2c4;color:#7a3d05}
+.ex{background:#fff6eb;border:1px solid #f0c48f;padding:12px 16px;margin:0 0 18px;border-radius:10px;font-size:14px;color:#6b3a06}
+.locked{position:relative;border:1px dashed #cfc9bc;border-radius:12px;padding:22px;background:repeating-linear-gradient(135deg,#fff,#fff 10px,#faf8f3 10px,#faf8f3 20px)}
+.order .li{display:flex;justify-content:space-between;padding:8px 0;font-size:15px}.order .tot{border-top:1px solid var(--line);margin-top:6px;padding-top:12px;font-weight:600;font-size:17px}
+.order ul{padding-left:18px;margin:8px 0 14px;font-size:14px;color:#353b45}.order li{margin:3px 0}
+.receipt{display:grid;grid-template-columns:auto 1fr;gap:4px 16px;font-size:14px}
+pre.code{background:#0f1b30;color:#e8edf5;padding:16px;border-radius:10px;overflow:auto;font:13px/1.55 "IBM Plex Mono",monospace;white-space:pre-wrap;margin:0;max-height:360px}
+.fix{margin:0 0 18px}.fixhead{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}
+ul.checks{list-style:none;padding:0;margin:0}ul.checks li{display:grid;grid-template-columns:56px 1fr;gap:12px;align-items:baseline;padding:12px 0;border-bottom:1px solid var(--line)}ul.checks .d{color:var(--mute);font-size:14px}
+.trend{display:flex;gap:28px;align-items:center;flex-wrap:wrap}.trend>div:last-child{min-width:300px}.gridhead{display:flex;justify-content:space-between;align-items:center;margin:22px 0 10px}
+footer{border-top:1px solid var(--line);margin-top:64px;padding:22px 0 40px;color:var(--mute);font-size:13px}
+@media (max-width:900px){.hero,.layout,.offer,.quotes,.steps{grid-template-columns:1fr}.kpis{grid-template-columns:1fr 1fr}aside{position:static}.steps div+div{border-left:0;padding-left:0}}
+@media print{.top,aside,.actions,.noprint,footer .noprint{display:none!important}body{background:#fff}.layout{grid-template-columns:1fr}section.s{break-inside:avoid-page}pre.code{max-height:none;background:#f3f0e8;color:#14181f}}
 </style>"""
 
 def ai_label():
     on = [e[0] for e in engines_on()]
-    return ", ".join(on) if on else ("no key, example data" if os.getenv("GFW_DEMO_ANSWERS") == "1" else "no key")
+    return ", ".join(on) if on else ("example data" if os.getenv("GFW_DEMO_ANSWERS") == "1" else "no key")
 
 def page(title, body):
-    return (f"<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>{html.escape(title)}</title>{CSS}{GRID_JS}"
-            f"<header><b>GeoForge Watch</b><span>PayPal checkout: {pay_mode()} · AI: {ai_label()}</span></header>"
-            f"<main>{body}<footer>GeoForge Watch is an AI tool. AI answers change day to day; this is a snapshot, not a ranking guarantee. Open source, MIT license.</footer></main>")
+    ai_warn = "" if engines_on() else " warn"
+    return (f"<!doctype html><html lang=en><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'><title>{E(title)}</title>{CSS}{GRID_JS}"
+            f"<div class=top><a class=brand href=/><i></i>GeoForge Watch</a><div class=pills><span class=pill>PayPal · {pay_mode()}</span>"
+            f"<span class='pill{ai_warn}'>AI · {E(ai_label())}</span></div></div>"
+            f"<div class=wrap>{body}<footer>GeoForge Watch is an AI tool. AI answers change from day to day, so each report is a snapshot, not a ranking promise. "
+            f"Open source, MIT license. Tables by AG Grid Community.</footer></div></html>")
 
-def gauge(value, label):
-    """Semicircle SVG gauge, 0-100."""
-    import math
-    v = max(0, min(100, value)); a = math.pi * (1 - v / 100); x, y = 100 + 80 * math.cos(a), 100 - 80 * math.sin(a)
-    col = "#1f7a4d" if v >= 70 else "#e8730c" if v >= 40 else "#b4401b"
-    return (f"<div class=gauge><svg viewBox='0 0 200 115' width=200 role=img aria-label='{html.escape(label)} {v} of 100'>"
-            f"<path d='M20 100 A80 80 0 0 1 180 100' fill=none stroke='#eef0f3' stroke-width=16 stroke-linecap=round />"
-            f"<path d='M20 100 A80 80 0 0 1 {x:.1f} {y:.1f}' fill=none stroke='{col}' stroke-width=16 stroke-linecap=round />"
-            f"<text x=100 y=96 text-anchor=middle font-size=34 font-weight=800 fill='#13233f'>{v}</text></svg><div class=lbl>{html.escape(label)}</div></div>")
+# ---------- report pieces ----------
+def ranking(ans, business, full):
+    """Every business AI named, ranked by share of answers. You are always shown; others unlock with the report."""
+    rows = [{"name": business, "rate": ans["mention_rate"], "you": True}] + [{"name": c["name"], "rate": c["rate"], "you": False} for c in ans["competitors"]]
+    rows.sort(key=lambda r: (-r["rate"], not r["you"])); out = []
+    for i, r in enumerate(rows[:8], 1):
+        nm = E(r["name"]) + (" <span class='chip you'>You</span>" if r["you"] else "")
+        if not full and not r["you"]: nm = f"<span class=blur>{'Locked business name'[:max(8, len(r['name']))]}</span>"
+        out.append(f"<li class='{'you' if r['you'] else ''}'><span class=i>{i}</span><span>{nm}</span><span class=b><i style='width:{r['rate']}%'></i></span><span class=p>{r['rate']}%</span></li>")
+    return "<ul class=rank>" + "".join(out) + "</ul>"
+
+def your_rank(ans, business):
+    rates = sorted({c["rate"] for c in ans["competitors"]} | {ans["mention_rate"]}, reverse=True)
+    pos = 1 + sum(1 for c in ans["competitors"] if c["rate"] > ans["mention_rate"])
+    return pos, 1 + len(ans["competitors"])
+
+def engine_cards(ans):
+    out = []
+    for e, v in ans["engines"].items():
+        recs = [r for r in ans["records"] if r["provider"] == e]
+        dots = "".join(f"<i class='{'on' if r['mentioned'] else ''}' title='{E(r['prompt'])}'></i>" for r in recs)
+        pct = round(100 * v["mentions"] / v["answers"]) if v["answers"] else 0
+        out.append(f"<div class='card eng'><div class='mono small mute'>{E(e)}</div><div class=v>{pct}%</div>"
+                   f"<div class='small mute'>named you in {v['mentions']} of {v['answers']} answers</div><div class=dots>{dots}</div></div>")
+    return "<div class=engines>" + "".join(out) + "</div>"
+
+def heat_grid(ans, business):
+    """Business x engine matrix: share of each engine's answers that name the business (AG Grid, heat-colored)."""
+    engines = list(ans["engines"])
+    def share(name, e, you=False):
+        recs = [r for r in ans["records"] if r["provider"] == e]
+        n = sum(1 for r in recs if (r["mentioned"] if you else name in r["named"]))
+        return round(100 * n / len(recs)) if recs else 0
+    rows = [{"business": business, "you": True, **{e: share(business, e, True) for e in engines}}]
+    rows += [{"business": c["name"], "you": False, **{e: share(c["name"], e) for e in engines}} for c in ans["competitors"]]
+    for r in rows: r["avg"] = round(sum(r[e] for e in engines) / len(engines)) if engines else 0
+    cols = [{"field": "business", "headerName": "Business", "flex": 2, "minWidth": 200, "pinned": "left", "you": True}] + \
+           [{"field": e, "headerName": e, "flex": 1, "minWidth": 120, "heat": True} for e in engines] + \
+           [{"field": "avg", "headerName": "All engines", "flex": 1, "minWidth": 120, "heat": True, "sort": "desc"}]
+    return (f"<div class=gridhead><h3>Share of each engine's answers, by business</h3><button class='ghost noprint' onclick=\"gfwCsv('gh','geoforge-engine-matrix.csv')\">Export CSV</button></div>"
+            f"<div id=gh></div><script>gfwGrid('gh',{_cfg(rows, cols, heatMax=max([r['avg'] for r in rows] + [r[e] for r in rows for e in engines] + [1]))})</script>")
+
+def answers_grid(ans, full):
+    rows = [{"engine": r["provider"], "query": r["prompt"], "mentioned": "Yes" if r["mentioned"] else "No",
+             "named": ", ".join(r["named"]) if full else f"{len(r['named'])} names, locked"} for r in ans["records"]]
+    cols = [{"field": "engine", "headerName": "Engine", "width": 170, "pinned": "left"},
+            {"field": "query", "headerName": "Question asked", "flex": 2, "minWidth": 260, "wrapText": True, "autoHeight": True},
+            {"field": "mentioned", "headerName": "Named you", "width": 120, "yes": True},
+            {"field": "named", "headerName": "Named instead", "flex": 2, "minWidth": 220, "wrapText": True, "autoHeight": True}]
+    csv = "<button class='ghost noprint' onclick=\"gfwCsv('ga','geoforge-ai-answers.csv')\">Export CSV</button>" if full else ""
+    return f"<div class=gridhead><h3>All answers</h3>{csv}</div><div id=ga></div><script>gfwGrid('ga',{_cfg(rows, cols)})</script>"
+
+def hl(text, names, business):
+    t = E(text)
+    for n in sorted(set(names), key=len, reverse=True):
+        if n: t = re.sub(re.escape(E(n)), lambda m: f"<mark>{m.group(0)}</mark>", t, flags=re.I)
+    return re.sub(re.escape(E(business)), lambda m: f"<mark class=you>{m.group(0)}</mark>", t, flags=re.I) if business else t
+
+def quotes(ans, business):
+    """Full answer text as readable cards (replaces the cramped excerpt column)."""
+    out = []
+    for r in ans["records"]:
+        badge = "<span class='chip ok'>Named you</span>" if r["mentioned"] else "<span class='chip no'>Not named</span>"
+        out.append(f"<div class=quote><div class=meta><span class=mono>{E(r['provider'])}</span>{badge}</div><div class=qq>{E(r['prompt'])}</div>"
+                   f"<p>{hl(r['answer'][:700], r['named'], business)}</p></div>")
+    return "<div class=quotes>" + "".join(out) + "</div>"
+
+PLAN_META = {  # check -> (impact, effort, where, why)
+    "AI crawlers allowed in robots.txt": ("High", "Low", "robots.txt", "Blocked crawlers can't read the site at all."),
+    "Business schema (JSON-LD)": ("High", "Low", "Homepage <head>", "Gives AI your name, phone, area and trade as structured facts."),
+    "llms.txt present": ("Medium", "Low", "/llms.txt", "A plain summary written for AI readers."),
+    "Question-style content": ("High", "Medium", "FAQ page", "AI answers questions; pages that answer them get quoted."),
+    "Phone number in page text": ("Medium", "Low", "Header or footer", "AI can't read a number inside an image."),
+    "Meta description": ("Low", "Low", "Homepage <head>", "Often reused as the one-line summary of you."),
+    "Page title": ("Medium", "Low", "Homepage <head>", "Should say the trade and the city."),
+    "Homepage loads": ("High", "Medium", "Hosting", "Nothing else matters if the page doesn't load."),
+}
+def action_plan(rd, ans, business, full):
+    items = []
+    for c in rd["checks"]:
+        if c["ok"]: continue
+        imp, eff, where, why = PLAN_META.get(c["check"], ("Medium", "Medium", "Website", ""))
+        items.append({"t": c["fix"], "why": why, "imp": imp, "eff": eff, "where": where})
+    if ans and ans["competitors"] and ans["mention_rate"] < (ans["competitors"][0]["rate"] or 0):
+        top = ans["competitors"][0]
+        items.append({"t": f"Close the gap with the most-named business ({top['rate']}% vs your {ans['mention_rate']}%).",
+                      "why": "Get listed on the same review sites and directories the answers draw on; ask recent customers for reviews that name the city.",
+                      "imp": "High", "eff": "High", "where": "Reviews and listings"})
+    items.append({"t": "Re-check in two weeks, after the fixes are live.", "why": "AI engines re-read sites slowly; track whether the rate moves.",
+                  "imp": "Medium", "eff": "Low", "where": "GeoForge Watch"})
+    score = {"High": 3, "Medium": 2, "Low": 1}
+    items.sort(key=lambda x: (-(score[x["imp"]] * 2 - score[x["eff"]])))
+    rows = []
+    for i, x in enumerate(items):
+        pr = "P1" if i < 2 else "P2" if i < 4 else "P3"
+        cls = {"High": "hi", "Medium": "md", "Low": "lo"}
+        why = E(x["why"]) if full or i < 2 else "<span class=blur>Unlock the report for the reason and the paste-ready fix</span>"
+        rows.append(f"<tr><td><span class='chip {pr.lower()}'>{pr}</span></td><td class=t><b>{E(x['t'])}</b><span>{why}</span></td>"
+                    f"<td><span class='chip {cls[x['imp']] if x['imp']!='Low' else 'p3'}'>{x['imp']}</span></td><td><span class='chip {cls[x['eff']]}'>{x['eff']}</span></td><td class=small>{E(x['where'])}</td></tr>")
+    return "<table class=plan><tr><th>Priority</th><th>Do this</th><th>Impact</th><th>Effort</th><th>Where</th></tr>" + "".join(rows) + "</table>"
 
 def checks_list(rd):
     return "<ul class=checks>" + "".join(
-        f"<li><span class='chip {'ok' if c['ok'] else 'no'}'>{'Pass' if c['ok'] else 'Fix'}</span> <b>{html.escape(c['check'])}</b> "
-        f"<span class=d>{html.escape(c['detail'])}</span>{'' if c['ok'] else '<div class=d>→ ' + html.escape(c['fix']) + '</div>'}</li>" for c in rd["checks"]) + "</ul>"
+        f"<li><span class='chip {'ok' if c['ok'] else 'no'}'>{'Pass' if c['ok'] else 'Fix'}</span><div><b>{E(c['check'])}</b> "
+        f"<span class=d>· {E(c['detail'])}</span></div></li>" for c in rd["checks"]) + "</ul>"
+
+def spark(vals, w=240, h=72, col="#13233f"):
+    vals = [v for v in vals if v is not None]
+    if len(vals) < 2: vals = vals * 2 if vals else [0, 0]
+    step = w / (len(vals) - 1); pts = " ".join(f"{i*step:.1f},{h-4-(h-8)*v/100:.1f}" for i, v in enumerate(vals))
+    return (f"<svg width={w} height={h} viewBox='0 0 {w} {h}' role=img aria-label='trend'><polyline points='{pts}' fill=none stroke='{col}' stroke-width=2.5 stroke-linejoin=round />"
+            f"<line x1=0 y1={h-4} x2={w} y2={h-4} stroke='#e2ddd2' /><line x1=0 y1=4 x2={w} y2=4 stroke='#e2ddd2' stroke-dasharray='3 4' />"
+            + "".join(f"<circle cx={i*step:.1f} cy={h-4-(h-8)*v/100:.1f} r=3.5 fill='{col}' />" for i, v in enumerate(vals)) + "</svg>")
+
+def trend(hist):
+    if not hist: return "<p class=mute>No checks recorded yet.</p>"
+    last = hist[-1]; first = hist[0]
+    d = (last["score"] - first["score"]); dr = None if last["rate"] is None or first["rate"] is None else last["rate"] - first["rate"]
+    ex = " (example AI data)" if any(h.get("example") for h in hist) else ""
+    def delta(x): return "<span class=mute>no change</span>" if not x else f"<b style='color:{'var(--ok)' if x>0 else 'var(--no)'}'>{x:+d}</b>"
+    return (f"<div class='card trend'><div><div class='mono small mute'>Site readiness</div>{spark([h['score'] for h in hist])}<div class=small>{last['score']}/100 · {delta(d)}</div></div>"
+            f"<div><div class='mono small mute'>AI mention rate{ex}</div>{spark([h['rate'] for h in hist], col='#e8730c')}<div class=small>{last['rate'] if last['rate'] is not None else '–'}% · {delta(dr)}</div></div>"
+            f"<div style='flex:1'><table class=plan style='font-size:13px'><tr><th>Checked</th><th>Site</th><th>AI rate</th></tr>"
+            + "".join(f"<tr><td class=mono>{E(x['ts'])}</td><td>{x['score']}</td><td>{'–' if x['rate'] is None else str(x['rate']) + '%'}</td></tr>" for x in hist[-5:][::-1])
+            + f"</table><p class='small mute' style='margin:6px 0 0'>{len(hist)} check{'s' if len(hist)!=1 else ''} on record. Scale 0–100; dashed line is 100.</p></div></div>")
 
 def fixes_html(fx):
     src = fx["source"]
-    lab = (f"<p class=note>Written for this site by the AI agent ({html.escape(src[3:])}) from the facts found on the page. Review before publishing.</p>" if src.startswith("ai:")
-           else "<div class=ex><strong>TEMPLATE, NOT AI-WRITTEN.</strong> No AI provider key is set, so these fixes are filled in from a fixed template "
-                "using the facts found on the site. Replace every [BRACKETED] placeholder before publishing.</div>")
+    lab = (f"<p class='small mute'>Written for this site by the AI agent ({E(src[3:])}) from facts found on the page. Check it before you publish.</p>" if src.startswith("ai:")
+           else "<div class=ex><b>Template, not AI-written.</b> No AI key is set, so these are filled in from a fixed template using facts found on the site. "
+                "Replace every [BRACKETED] placeholder before you publish.</div>")
     ld = json.dumps(fx["jsonld"], indent=2) if not isinstance(fx["jsonld"], str) else fx["jsonld"]
     faq = "\n\n".join(f"Q: {f.get('q','')}\nA: {f.get('a','')}" for f in fx["faq"] if isinstance(f, dict))
     def blk(i, title, where, body):
-        return (f"<div class=fix><div class=fixhead><h3>{title}</h3><button class=ghost onclick=\"gfwCopy('{i}',this)\">Copy</button></div>"
-                f"<p class=note>{where}</p><pre class=code id={i}>{html.escape(body)}</pre></div>")
-    return ("<h2>Your fixes, ready to paste</h2>" + lab +
-            blk("fx1", "llms.txt", "Save as /llms.txt at the root of your site.", fx["llms_txt"]) +
+        return (f"<div class=fix><div class=fixhead><h3>{title}</h3><button class='ghost noprint' onclick=\"gfwCopy('{i}',this)\">Copy</button></div>"
+                f"<p class='small mute' style='margin:0 0 8px'>{where}</p><pre class=code id={i}>{E(body)}</pre></div>")
+    return (lab + blk("fx1", "llms.txt", "Save as /llms.txt at the root of your site.", fx["llms_txt"]) +
             blk("fx2", "LocalBusiness schema (JSON-LD)", "Paste inside &lt;script type=\"application/ld+json\"&gt; in your homepage &lt;head&gt;.", ld) +
-            blk("fx3", "FAQ copy", "Add to your homepage or an FAQ page, in plain HTML text.", faq))
+            blk("fx3", "FAQ copy", "Add to your homepage or an FAQ page as plain HTML text.", faq))
+
+def sec(n, title, sub, body, right=""):
+    return f"<section class=s><div class=num>{n}</div><div class=sh><div><h2>{title}</h2><p class=mute>{sub}</p></div>{right}</div>{body}</section>"
+
+def report_view(rd, ans, q, full, key=None, fx=None, cap=None, share=None, hist=None, sub=None):
+    biz, trade, city = q["business"], q.get("trade", ""), q.get("city", "")
+    when = time.strftime("%b %-d, %Y")
+    acts = ""
+    if full:
+        acts = ("<div class='actions noprint'>" + (f"<button class=ghost data-url='{E(share)}' onclick='gfwShare(this)'>Copy share link</button>" if share else "")
+                + "<button class=ghost onclick='window.print()'>Save as PDF</button>"
+                + f"<a class='btn ghost' href='/check?{urllib.parse.urlencode({'url': rd['url'], 'business': biz, 'trade': trade, 'city': city})}'>Re-check</a></div>")
+    head = (f"<div class=rhead><div><div class=eyebrow>{'AI visibility report' if full else 'Free check'} · {when}</div><h1>{E(biz)}</h1>"
+            f"<div class=mute><span class=mono>{E(host_of(rd['url']))}</span> · {E(trade)} · {E(city)}</div></div>{acts}</div>")
+    if ans:
+        pos, n = your_rank(ans, biz)
+        top = ans["competitors"][0]["rate"] if ans["competitors"] else 0
+        kpi_ai = (f"<div class=kpi><div class=v>{ans['mention_rate']}<small>%</small></div><div class=l>of AI answers name you</div><div class='d mute'>{ans['mentions']} of {ans['answers']} answers</div></div>"
+                  f"<div class=kpi><div class=v>#{pos}<small> of {n}</small></div><div class=l>your place among businesses named</div><div class='d mute'>top business: {top}%</div></div>"
+                  f"<div class=kpi><div class=v>{len(ans['engines'])}</div><div class=l>AI engines asked</div><div class='d mute'>{len(prompts(trade, city))} homeowner questions each</div></div>")
+    else:
+        kpi_ai = "<div class=kpi><div class=v>–</div><div class=l>AI answers not measured</div></div>"
+    fails = sum(1 for c in rd["checks"] if not c["ok"])
+    kpis = (f"<div class=kpis><div class=kpi><div class=v>{rd['score']}<small>/100</small></div><div class=l>can AI read your site</div>"
+            f"<div class='d mute'>{fails} fix{'es' if fails != 1 else ''} found</div></div>{kpi_ai}</div>")
+    main = ""
+    if cap:
+        main += (f"<div class='card' style='margin-top:28px;display:flex;justify-content:space-between;gap:20px;flex-wrap:wrap'><div><span class='chip ok'>Payment {E(cap['status'])}</span> "
+                 f"<b style='margin-left:6px'>$29.00 USD</b> <span class=mute>· PayPal {E(cap['mode'])}</span></div><div class=receipt><span class=mute>Order</span><code>{E(str(cap.get('order_id')))}</code>"
+                 f"<span class=mute>Capture</span><code>{E(str(cap.get('capture_id')))}</code></div></div>")
+    if ans:
+        main += sec("01", "Who AI names when a homeowner asks", f"Share of {ans['answers']} answers that named each business.",
+                    example_banner(ans) + ranking(ans, biz, full) + ("" if full else "<p class='small mute'>Names of other businesses unlock with the full report.</p>"))
+        main += sec("02", "Engine by engine", "Each square is one question. Orange means that engine named you.",
+                    engine_cards(ans) + (heat_grid(ans, biz) if full else "<div class=locked><b>Business × engine matrix</b><p class='mute small' style='margin:4px 0 0'>See which engine favors which competitor, with CSV export. Included in the full report.</p></div>"))
+    main += sec("03" if ans else "01", "Action plan", "Ordered by impact for the effort. Do the P1 items first.", action_plan(rd, ans, biz, full))
+    if full and fx: main += sec("04", "Fixes, ready to paste", "Written for this site. Copy each block into place.", fixes_html(fx))
+    if ans:
+        main += sec("05" if full else "04", "What the engines said", "The full answers, with every business name marked. Yours is orange.",
+                    (quotes(ans, biz) if full else "") + answers_grid(ans, full))
+    main += sec("06" if full else "05", "Site check", f"{len(rd['checks'])} things AI crawlers look for on {E(host_of(rd['url']))}.", f"<div class=card>{checks_list(rd)}</div>")
+    main += sec("07" if full else "06", "Over time", "Each check is saved, so you can see whether your fixes moved the numbers.", trend(hist or []))
+    side = ""
+    if not full and key:
+        side = (f"<aside><div class='card order'><div class=eyebrow style='margin-bottom:10px'>Full report</div><div class=li><span>AI visibility report<br><span class='small mute'>{E(host_of(rd['url']))}</span></span><span>$29.00</span></div>"
+                f"<div class='li tot'><span>Total</span><span>$29.00 USD</span></div><ul><li>Every business AI named, and how often</li><li>Business × engine matrix, CSV export</li>"
+                f"<li>llms.txt, schema and FAQ written for your site</li><li>Share link and PDF</li></ul>{checkout(key)}</div>"
+                f"<div class='card' style='margin-top:14px'><b>Weekly watch</b> <span class=mute>· $29/month</span><p class='small mute' style='margin:6px 0 12px'>Same questions every week, with the trend line above. Cancel anytime in PayPal.</p>"
+                f"<a class='btn ghost' href='/watch?k={key}'>Set up weekly watch</a></div></aside>")
+    if full and sub is not None:
+        side = ""
+    layout = "layout" if side else "layout one"
+    return head + kpis + f"<div class='{layout}'><div>{main}</div>{side}</div>"
 
 # ---------- local demo server ----------
 PENDING = {}; ORDERS = {}; ANS = {}; PORT = 8787
-FORM = """<h1>When someone asks AI for a roofer in your town, are you the answer?</h1>
-<p>Run a free check of your website. For <b>$29</b>, paid with PayPal, get the full report: which businesses ChatGPT-style assistants name instead of you, broken down by engine, plus fixes written for your site that you can paste in.</p>
-<form method=get action=/check class=card><label>Website<input name=url required placeholder="https://yourcompany.com"></label><label>Business name<input name=business required></label>
-<div class=row style="gap:12px"><div style="flex:1"><label>Trade<input name=trade value=roofer></label></div><div style="flex:1"><label>City<input name=city value="Birmingham, AL"></label></div></div>
-<button class=primary>Run free check</button></form>"""
+LANDING = """<div class=hero><div><div class=eyebrow>For local trades · AI search check</div>
+<h1>Ask AI for a roofer in your town. Are you in the answer?</h1>
+<p class=lede>Homeowners now ask ChatGPT who to call. GeoForge Watch asks AI engines the same questions a homeowner would and shows you who gets named. Then it writes the fixes for your site.</p>
+<form method=get action=/check class=check><label class=full>Website<input name=url required placeholder="yourcompany.com"></label>
+<label class=full>Business name<input name=business required placeholder="As customers know it"></label>
+<label>Trade<input name=trade value=roofer></label><label>City<input name=city value="Birmingham, AL"></label>
+<div class=full><button class=primary>Run the free check</button> <span class='small mute' style='margin-left:10px'>About 20 seconds. No sign-up.</span></div></form></div>
+<div><div class=answer><div class=q>“Who's the best <b>roofer</b> in <b>Birmingham, AL</b>?”</div><ol>
+<li><span>A roofer the AI likes</span><span class='chip p3'>named</span></li><li><span>Another roofer</span><span class='chip p3'>named</span></li>
+<li><span>A third roofer</span><span class='chip p3'>named</span></li><li class=you><span>Your business</span><span class='chip no'>missing</span></li></ol>
+<div class=cap>Illustration. Your check uses real answers when an AI key is set; until then it's labeled example data.</div></div></div></div>
+<div class=steps><div><div class=n>01</div><h3>Read your site the way AI does</h3><p class='mute small'>Crawler rules, llms.txt, business schema, phone in text, FAQ-style content. Scored out of 100.</p></div>
+<div><div class=n>02</div><h3>Ask the engines</h3><p class='mute small'>Five questions a homeowner would type, to every engine with a key. We count who gets named.</p></div>
+<div><div class=n>03</div><h3>Fix it, then watch it</h3><p class='mute small'>Paste-ready llms.txt, schema and FAQ for your site. Re-check to see the numbers move.</p></div></div>
+<div class=offer><div class=card><div class=eyebrow>Free</div><div class=price>$0</div><ul><li>Site readiness score out of 100</li><li>Your mention rate and your place in line</li></ul></div>
+<div class='card hl'><div class=eyebrow>Full report</div><div class=price>$29</div><ul><li>Every business named, by engine</li><li>The full action plan</li><li>llms.txt, schema and FAQ written for your site</li><li>A share link and a PDF</li></ul><p class='small mute'>One payment through PayPal.</p></div>
+<div class=card><div class=eyebrow>Weekly watch</div><div class=price>$29<span style='font-size:18px'>/mo</span></div><ul><li>Same questions every week</li><li>Trend line for both scores</li><li>Cancel anytime in PayPal</li></ul><p class='small mute'>PayPal Subscriptions.</p></div></div>"""
 
 def checkout(key):
     cid = _creds()[0]
-    if not cid:  # mock mode only: no PayPal, one plain button
-        return f"<p class=note>PayPal is in MOCK mode (no sandbox keys). Nothing is charged.</p><a href='/buy?k={key}'><button class=primary>Pay $29 (mock checkout)</button></a>"
-    return f"""<div id=pp></div><script src="https://www.paypal.com/sdk/js?client-id={html.escape(cid)}&currency=USD&intent=capture"></script>
-<script>paypal.Buttons({{createOrder:()=>fetch('/api/orders?k={key}',{{method:'POST'}}).then(r=>r.json()).then(o=>o.id),
+    if not cid:
+        return f"<p class='small mute'>PayPal is in mock mode (no sandbox keys). Nothing is charged.</p><a class='btn primary' href='/buy?k={key}'>Pay $29 (mock checkout)</a>"
+    return f"""<div id=pp></div><script src="https://www.paypal.com/sdk/js?client-id={E(cid)}&currency=USD&intent=capture"></script>
+<script>paypal.Buttons({{style:{{shape:'rect',height:44}},createOrder:()=>fetch('/api/orders?k={key}',{{method:'POST'}}).then(r=>r.json()).then(o=>o.id),
 onApprove:d=>{{document.getElementById('pp').style.display='none';document.getElementById('cf').style.display='block';location.href='/paid?k={key}&token='+d.orderID}}}}).render('#pp');</script>
-<p id=cf style="display:none;font-weight:600">Confirming payment&hellip;</p><p class=note>PayPal sandbox: test money only.</p>"""
+<p id=cf style="display:none;font-weight:600">Confirming payment&hellip;</p><p class='small mute' style='margin:8px 0 0'>PayPal sandbox: test money only.</p>"""
+
+def watch_page(key, rd, q):
+    plan = paypal_plan_id(); cid = _creds()[0]; host = E(host_of(rd["url"]))
+    if not plan: btn = "<p>Couldn't set up the PayPal plan right now. Try again in a minute.</p>"
+    elif not cid: btn = f"<p class='small mute'>PayPal is in mock mode. Nothing is charged.</p><a class='btn primary' href='/watching?k={key}&sid=MOCK-SUB'>Start weekly watch (mock)</a>"
+    else:
+        btn = (f"<div id=ps></div><script src='https://www.paypal.com/sdk/js?client-id={E(cid)}&vault=true&intent=subscription'></script>"
+               f"<script>paypal.Buttons({{style:{{shape:'rect',label:'subscribe',height:44}},createSubscription:(d,a)=>a.subscription.create({{plan_id:'{E(plan)}',custom_id:'{E(host)}'}}),"
+               f"onApprove:d=>{{location.href='/watching?k={key}&sid='+d.subscriptionID}}}}).render('#ps');</script><p class='small mute'>PayPal sandbox: test money only.</p>")
+    return (f"<div class=rhead><div><div class=eyebrow>Weekly watch</div><h1>Keep an eye on {E(q['business'])}</h1><div class=mute><span class=mono>{host}</span></div></div></div>"
+            f"<div class=layout><div>{sec('01', 'What you get', 'Every Monday, the same questions go to every engine with a key.', '<ul><li>Mention rate and your place, week by week</li><li>Site readiness re-scored</li><li>A note when you drop out of an answer you used to be in</li></ul>')}"
+            f"{sec('02', 'So far', 'Checks on record for this site.', trend(history_for(rd['url'])))}</div>"
+            f"<aside><div class='card order'><div class=li><span>Weekly watch<br><span class='small mute'>billed monthly</span></span><span>$29.00</span></div><div class='li tot'><span>Per month</span><span>$29.00 USD</span></div>"
+            f"<p class='small mute'>Cancel anytime from your PayPal account.</p>{btn}<p class='small mute mono' style='margin-top:10px'>plan {E(str(plan))}</p></div></aside></div>")
+
+def save_report(blob):
+    tok = base64.urlsafe_b64encode(os.urandom(9)).decode().rstrip("=")
+    _jsave(os.path.join(DATA, "reports", tok + ".json"), blob); return tok
 
 class H(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.0"
     def send(self, body, code=200, ctype="text/html; charset=utf-8"):
         b = body.encode(); self.send_response(code); self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(b))); self.send_header("Connection", "close"); self.end_headers(); self.wfile.write(b)
+    def base(self): return f"http://{self.headers.get('Host') or '127.0.0.1:%d' % PORT}"
     def _order(self, k):
-        o = paypal_create_order(return_url=f"http://127.0.0.1:{PORT}/paid?k={k}", cancel_url=f"http://127.0.0.1:{PORT}/")
+        o = paypal_create_order(return_url=f"{self.base()}/paid?k={k}", cancel_url=f"{self.base()}/")
         if o.get("id"): ORDERS[o["id"]] = k
         return o
     def do_POST(self):
@@ -476,22 +735,29 @@ class H(BaseHTTPRequestHandler):
         self.send("not found", 404)
     def do_GET(self):
         u = urllib.parse.urlparse(self.path); q = {k: v[0] for k, v in urllib.parse.parse_qs(u.query).items()}
-        if u.path == "/": return self.send(page("GeoForge Watch", FORM))
+        if u.path == "/": return self.send(page("GeoForge Watch: are you in the AI answer?", LANDING))
         if u.path == "/check":
+            if not q.get("url") or not q.get("business"): return self.send(page("GeoForge Watch", LANDING), 400)
             rd = readiness(q["url"]); key = str(len(PENDING) + 1); PENDING[key] = (rd, q)
             ans = gather(q["business"], q.get("trade", "roofer"), q.get("city", ""), os.getenv("GFW_ANSWERS_FILE")); ANS[key] = ans
-            g2 = gauge(ans["mention_rate"], "AI answers that name you (%)") if ans else ""
-            body = (f"<h1>{html.escape(q['business'])}</h1><p class=note>{html.escape(rd['url'])} · {html.escape(q.get('trade',''))} · {html.escape(q.get('city',''))}</p>"
-                    f"<div class=row><div class=card>{gauge(rd['score'], 'Can AI read your site? (score)')}</div><div class=card>{g2 or '<p class=note>AI answers not measured.</p>'}</div>"
-                    f"<div class=card><div class=price>$29</div><p>Full report: who AI names instead of you, by engine, with CSV export, plus ready-to-paste fixes for your site.</p>{checkout(key)}</div></div>"
-                    f"<h2>Site check</h2><div class=card>{checks_list(rd)}</div><h2>Does AI name you?</h2>{example_banner(ans)}{answers_grid(ans, False)}"
-                    f"<p class=note>Tables: AG Grid Community (MIT). Sort by clicking a header; filter from the column menu.</p><p><a href=/>← New check</a></p>")
-            return self.send(page("Free check · GeoForge Watch", body))
+            hist = record_history(rd, ans)
+            return self.send(page(f"Free check · {q['business']}", report_view(rd, ans, q, False, key=key, hist=hist)))
+        if u.path == "/watch":
+            k = q.get("k")
+            if k not in PENDING: return self.send("unknown check", 404)
+            rd, form = PENDING[k]; return self.send(page("Weekly watch · GeoForge Watch", watch_page(k, rd, form)))
+        if u.path == "/watching":
+            k = q.get("k"); s = paypal_subscription(q.get("sid", ""))
+            ok = s.get("status") in ("ACTIVE", "APPROVED")
+            body = (f"<div class=rhead><div><div class=eyebrow>Weekly watch</div><h1>{'You are on the watch list.' if ok else 'Subscription not active.'}</h1>"
+                    f"<div class=mute>PayPal subscription <code>{E(str(s.get('id')))}</code> · status <b>{E(str(s.get('status')))}</b> · {E(s['mode'])}</div></div></div>"
+                    + (f"<p class=lede>The first weekly check runs next Monday.</p><p><a class='btn ghost' href='/watch?k={E(k or '')}'>Back</a></p>" if ok else "<p>Nothing was charged.</p>"))
+            return self.send(page("Weekly watch", body), 200 if ok else 402)
         if u.path == "/buy":
             k = q.get("k")
             if k not in PENDING: return self.send("unknown check", 404)
             o = self._order(k)
-            if not o.get("approve"): return self.send(f"<p>PayPal order failed (HTTP {o.get('http')}, {html.escape(str(o.get('error')))}).</p>", 502)
+            if not o.get("approve"): return self.send(f"<p>PayPal order failed (HTTP {o.get('http')}, {E(str(o.get('error')))}).</p>", 502)
             loc = o["approve"] + (f"&k={k}" if o["mode"] == "mock" else "")
             self.send_response(302); self.send_header("Location", loc); self.end_headers(); return
         if u.path == "/paid":
@@ -500,20 +766,17 @@ class H(BaseHTTPRequestHandler):
             t0 = time.time(); cap = paypal_capture(oid); dt = time.time() - t0
             print(f"capture {cap.get('status')} HTTP {cap.get('http')} in {dt:.2f}s", flush=True)
             if cap.get("status") != "COMPLETED":
-                return self.send(page("Payment not completed", f"<div class=card><p>Payment not completed (HTTP {cap.get('http')}, {html.escape(str(cap.get('issue') or cap.get('error')))}). No charge was made and the report stays locked.</p><p><a href='/buy?k={k}'>Try again</a></p></div>"), 402)
+                return self.send(page("Payment not completed", f"<div class=card style='margin-top:40px'><p>Payment not completed (HTTP {cap.get('http')}, {E(str(cap.get('issue') or cap.get('error')))}). Nothing was charged and the report stays locked.</p><p><a href='/buy?k={k}'>Try again</a></p></div>"), 402)
             ORDERS.pop(oid, None); rd, form = PENDING[k]; biz, trade, city = form["business"], form.get("trade", ""), form.get("city", "")
             ans = ANS.get(k) or gather(biz, trade, city, os.getenv("GFW_ANSWERS_FILE"))
             fx = make_fixes(rd, ans, biz, trade, city)
-            eng = "".join(f"<li>{html.escape(e)}: named you in {v['mentions']} of {v['answers']}</li>" for e, v in (ans or {}).get("engines", {}).items())
-            body = (f"<div class=card><b>Payment {html.escape(cap['status'])}</b> · $29.00 USD · PayPal {html.escape(cap['mode'])}"
-                    f"<div class=receipt style='margin-top:8px'><span>PayPal order ID</span><code>{html.escape(str(cap.get('order_id')))}</code>"
-                    f"<span>Capture ID</span><code>{html.escape(str(cap.get('capture_id')))}</code></div></div>"
-                    f"<h1>GeoForge Watch report: {html.escape(biz)}</h1><p class=note>{html.escape(rd['url'])} · {html.escape(trade)} · {html.escape(city)}</p>"
-                    f"<div class=row><div class=card>{gauge(rd['score'], 'Can AI read your site? (score)')}</div>"
-                    + (f"<div class=card>{gauge(ans['mention_rate'], 'AI answers that name you (%)')}<ul class=note>{eng}</ul></div>" if ans else "") + "</div>"
-                    f"<h2>Does AI name you?</h2>{example_banner(ans)}{competitor_grid(ans, biz)}{answers_grid(ans, True)}"
-                    f"{fixes_html(fx)}<h2>Site check</h2><div class=card>{checks_list(rd)}</div>")
-            return self.send(page("Full report · GeoForge Watch", body))
+            tok = save_report({"rd": rd, "ans": ans, "q": form, "fx": fx, "cap": cap})
+            self.send_response(303); self.send_header("Location", f"/r/{tok}"); self.send_header("Content-Length", "0"); self.end_headers(); return
+        if u.path.startswith("/r/"):
+            tok = re.sub(r"[^A-Za-z0-9_-]", "", u.path[3:]); b = _jload(os.path.join(DATA, "reports", tok + ".json"), None)
+            if not b: return self.send(page("Not found", "<p style='margin-top:40px'>No report at this link.</p>"), 404)
+            return self.send(page(f"AI visibility report · {b['q']['business']}", report_view(b["rd"], b["ans"], b["q"], True, fx=b["fx"], cap=b["cap"],
+                             share=f"{self.base()}/r/{tok}", hist=history_for(b["rd"]["url"]))))
         self.send("not found", 404)
     def log_message(self, *a): pass
 
