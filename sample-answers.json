@@ -1,2 +1,105 @@
-[{"provider":"fixture","prompt":"Who are the best painters in Birmingham, AL?","answer":"1. Example Painting Co: highly rated\n2. **Sample Pro Painters** - residential\n3. Test Coatings LLC"},
- {"provider":"fixture","prompt":"I need a painter in Birmingham, AL. Who should I call?","answer":"You could try **Sample Pro Painters** or CB Built Homes, which does painting and remodels."}]
+[
+ {
+  "provider": "example-engine-a",
+  "prompt": "Who are the best painters in Birmingham, AL?",
+  "answer": "EXAMPLE ANSWER (invented). Homeowners often call Example Painting Co, Sample Pro Painters, Test Coatings LLC. Get two or three written quotes before you hire.",
+  "businesses": [
+   "Example Painting Co",
+   "Sample Pro Painters",
+   "Test Coatings LLC"
+  ],
+  "extraction": "example fixture"
+ },
+ {
+  "provider": "example-engine-a",
+  "prompt": "I need a painter in Birmingham, AL. Who should I call?",
+  "answer": "EXAMPLE ANSWER (invented). Homeowners often call Sample Pro Painters, CB Built Homes. Get two or three written quotes before you hire.",
+  "businesses": [
+   "Sample Pro Painters",
+   "CB Built Homes"
+  ],
+  "extraction": "example fixture"
+ },
+ {
+  "provider": "example-engine-a",
+  "prompt": "Recommend a reliable painter near Birmingham, AL with good reviews.",
+  "answer": "EXAMPLE ANSWER (invented). Homeowners often call Example Painting Co, Placeholder Finishes. Get two or three written quotes before you hire.",
+  "businesses": [
+   "Example Painting Co",
+   "Placeholder Finishes"
+  ],
+  "extraction": "example fixture"
+ },
+ {
+  "provider": "example-engine-a",
+  "prompt": "What painter companies in Birmingham, AL do you recommend for a homeowner?",
+  "answer": "EXAMPLE ANSWER (invented). Homeowners often call Sample Pro Painters, Example Painting Co, Test Coatings LLC. Get two or three written quotes before you hire.",
+  "businesses": [
+   "Sample Pro Painters",
+   "Example Painting Co",
+   "Test Coatings LLC"
+  ],
+  "extraction": "example fixture"
+ },
+ {
+  "provider": "example-engine-a",
+  "prompt": "Top rated painter Birmingham, AL",
+  "answer": "EXAMPLE ANSWER (invented). Homeowners often call Example Painting Co, Sample Pro Painters. Get two or three written quotes before you hire.",
+  "businesses": [
+   "Example Painting Co",
+   "Sample Pro Painters"
+  ],
+  "extraction": "example fixture"
+ },
+ {
+  "provider": "example-engine-b",
+  "prompt": "Who are the best painters in Birmingham, AL?",
+  "answer": "EXAMPLE ANSWER (invented). Homeowners often call Sample Pro Painters, Fixture Brush & Roll. Get two or three written quotes before you hire.",
+  "businesses": [
+   "Sample Pro Painters",
+   "Fixture Brush & Roll"
+  ],
+  "extraction": "example fixture"
+ },
+ {
+  "provider": "example-engine-b",
+  "prompt": "I need a painter in Birmingham, AL. Who should I call?",
+  "answer": "EXAMPLE ANSWER (invented). Homeowners often call Example Painting Co, Fixture Brush & Roll, CB Built Homes. Get two or three written quotes before you hire.",
+  "businesses": [
+   "Example Painting Co",
+   "Fixture Brush & Roll",
+   "CB Built Homes"
+  ],
+  "extraction": "example fixture"
+ },
+ {
+  "provider": "example-engine-b",
+  "prompt": "Recommend a reliable painter near Birmingham, AL with good reviews.",
+  "answer": "EXAMPLE ANSWER (invented). Homeowners often call Sample Pro Painters. Get two or three written quotes before you hire.",
+  "businesses": [
+   "Sample Pro Painters"
+  ],
+  "extraction": "example fixture"
+ },
+ {
+  "provider": "example-engine-b",
+  "prompt": "What painter companies in Birmingham, AL do you recommend for a homeowner?",
+  "answer": "EXAMPLE ANSWER (invented). Homeowners often call Placeholder Finishes, Example Painting Co. Get two or three written quotes before you hire.",
+  "businesses": [
+   "Placeholder Finishes",
+   "Example Painting Co"
+  ],
+  "extraction": "example fixture"
+ },
+ {
+  "provider": "example-engine-b",
+  "prompt": "Top rated painter Birmingham, AL",
+  "answer": "EXAMPLE ANSWER (invented). Homeowners often call Fixture Brush & Roll, Sample Pro Painters, Test Coatings LLC. Get two or three written quotes before you hire.",
+  "businesses": [
+   "Fixture Brush & Roll",
+   "Sample Pro Painters",
+   "Test Coatings LLC"
+  ],
+  "extraction": "example fixture"
+ }
+]
